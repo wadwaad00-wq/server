@@ -1,103 +1,164 @@
 #!/usr/bin/env python3
-# server_ws.py — Railway-safe Hopper (HTTP + WS + auto-scan)
+# -*- coding: utf-8 -*-
 
-import asyncio, json, time, os
+"""
+Roblox JobId Scanner + WebSocket Server
+Python 3.10+
+pip install aiohttp websockets
+"""
+
+import asyncio
+import json
+import os
+import time
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
-from aiohttp import web
 import websockets
+from aiohttp import web
 
-PORT = int(os.environ.get("PORT", 8080))
+# =====================================================
+# CONFIG
+# =====================================================
 
-# 🔴 CHANGE THIS TO YOUR PLACE ID
-PLACE_ID = os.environ.get("PLACE_ID", "123456789")
-MIN_PLAYERS = int(os.environ.get("MIN_PLAYERS", 5))
+PLACE_ID = os.getenv("PLACE_ID", "109983668079237")  # change or set in Railway
+MIN_PLAYERS = int(os.getenv("MIN_PLAYERS", "5"))
+PORT = int(os.getenv("PORT", "8080"))
 
+SCAN_DELAY = 1.2
 PAGE_LIMIT = 100
-ORDERS = ("Asc", "Desc")
 
-def now_ms(): return int(time.time() * 1000)
+# =====================================================
+# STATE
+# =====================================================
 
-# --------------------------------------------------
-class Universe:
-    def __init__(self, uid):
-        self.uid = uid
-        self.min_players = MIN_PLAYERS
-        self.queue = []
-        self.seen = set()
-        self.cursor = {"Asc": None, "Desc": None}
-        self.scanning = False
+queue: list[str] = []
+seen: set[str] = set()
+clients: set[websockets.WebSocketServerProtocol] = set()
 
-universe = Universe(PLACE_ID)
+# =====================================================
+# HELPERS
+# =====================================================
 
-# --------------------------------------------------
-def is_joinable(s):
-    playing = int(s.get("playing", 0))
-    maxp = int(s.get("maxPlayers", 0))
-    return maxp > playing and playing >= universe.min_players
+def now():
+    return int(time.time())
 
-# --------------------------------------------------
-async def fetch_page(session, cursor, order):
-    base = f"https://games.roblox.com/v1/games/{universe.uid}/servers/Public"
-    url = f"{base}?sortOrder={order}&limit={PAGE_LIMIT}"
-    if cursor:
-        url += f"&cursor={cursor}"
-    async with session.get(url) as r:
-        r.raise_for_status()
-        return await r.json()
+def is_joinable(server: dict) -> bool:
+    playing = int(server.get("playing", 0))
+    maxp = int(server.get("maxPlayers", 0))
+    if playing < MIN_PLAYERS:
+        return False
+    if maxp <= playing:
+        return False
+    if server.get("vipServerId") or server.get("privateServerId"):
+        return False
+    return True
 
-# --------------------------------------------------
-async def scanner_loop():
-    if universe.scanning:
-        return
-    universe.scanning = True
+# =====================================================
+# ROBLOX SCANNER
+# =====================================================
 
-    print(f"[SCAN] Starting scan for placeId={universe.uid}")
+async def scan_servers():
+    print(f"[SCAN] Starting scan for placeId={PLACE_ID}")
+
+    url_base = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+    cursor = None
 
     async with aiohttp.ClientSession() as session:
         while True:
-            for order in ORDERS:
-                try:
-                    page = await fetch_page(session, universe.cursor[order], order)
-                    universe.cursor[order] = page.get("nextPageCursor")
+            params = {
+                "limit": PAGE_LIMIT,
+                "sortOrder": "Desc",
+                "excludeFullGames": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
 
-                    for sv in page.get("data", []):
-                        sid = str(sv.get("id") or "")
-                        if not sid or sid in universe.seen:
-                            continue
-                        if not is_joinable(sv):
-                            continue
+            try:
+                async with session.get(url_base, params=params) as r:
+                    data = await r.json()
+            except Exception as e:
+                print("[ERROR] Roblox API:", e)
+                await asyncio.sleep(3)
+                continue
 
-                        universe.seen.add(sid)
-                        universe.queue.append(sid)
+            for s in data.get("data", []):
+                if not is_joinable(s):
+                    continue
 
-                        # ✅ PRINT JOB IDS HERE
-                        print(f"[FOUND] jobId={sid} players={sv.get('playing')}")
+                job_id = s.get("id")
+                if not job_id or job_id in seen:
+                    continue
 
-                except Exception as e:
-                    print("[SCAN ERROR]", e)
+                seen.add(job_id)
+                queue.append(job_id)
 
-            await asyncio.sleep(1)
+                # 🔥 PRINT JOB ID
+                print(f"[FOUND] jobId={job_id} players={s.get('playing')}")
 
-# --------------------------------------------------
+                # Push to all connected WS clients
+                for ws in list(clients):
+                    try:
+                        await ws.send(json.dumps({"type": "job", "id": job_id}))
+                    except:
+                        clients.discard(ws)
+
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                await asyncio.sleep(SCAN_DELAY)
+
+# =====================================================
+# WEBSOCKET HANDLER (MODERN)
+# =====================================================
+
 async def ws_handler(ws):
+    # IMPORTANT: filter path manually
+    if ws.path != "/ws":
+        await ws.close(code=1008, reason="Invalid path")
+        return
+
+    clients.add(ws)
     print("[WS] client connected")
 
-    while universe.queue:
-        sid = universe.queue.pop(0)
-        print(f"[SEND] jobId={sid}")
-        await ws.send(json.dumps({"type": "next", "id": sid}))
-        break
+    # Send backlog
+    for job in queue[-25:]:
+        await ws.send(json.dumps({"type": "job", "id": job}))
 
-# --------------------------------------------------
-async def http_root(request):
+    try:
+        async for _ in ws:
+            pass
+    finally:
+        clients.discard(ws)
+        print("[WS] client disconnected")
+
+# =====================================================
+# HTTP SERVER (FOR BROWSER)
+# =====================================================
+
+async def http_index(_):
     return web.Response(
-        text="Hopper backend running.\nUse WebSocket at /ws\n",
-        content_type="text/plain"
+        text="""
+        <html>
+        <body>
+        <h2>Roblox JobId Scanner</h2>
+        <pre id="out"></pre>
+        <script>
+        const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+        ws.onmessage = e => {
+            const d = JSON.parse(e.data);
+            document.getElementById("out").textContent += d.id + "\\n";
+        };
+        </script>
+        </body>
+        </html>
+        """,
+        content_type="text/html"
     )
 
-# --------------------------------------------------
+# =====================================================
+# MAIN
+# =====================================================
+
 async def main():
     print("=" * 60)
     print("🚀 HOPPER BACKEND (HTTP + WS)")
@@ -106,21 +167,20 @@ async def main():
     print(f"👥 minPlayers: {MIN_PLAYERS}")
     print("=" * 60)
 
-    # 🔥 START SCANNER IMMEDIATELY
-    asyncio.create_task(scanner_loop())
-
-    # HTTP server (browser-safe)
+    # HTTP app
     app = web.Application()
-    app.router.add_get("/", http_root)
+    app.router.add_get("/", http_index)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    # WebSocket server
-    await websockets.serve(ws_handler, "0.0.0.0", PORT, path="/ws")
+    # WebSocket server (NO path argument)
+    await websockets.serve(ws_handler, "0.0.0.0", PORT)
 
-    await asyncio.Future()
+    # Scanner
+    await scan_servers()
 
 if __name__ == "__main__":
     asyncio.run(main())
