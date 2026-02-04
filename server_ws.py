@@ -1,137 +1,126 @@
 #!/usr/bin/env python3
-# server_ws.py — WebSocket hopper backend (PRINT DEBUG ENABLED)
+# server_ws.py — Railway-safe Hopper (HTTP + WS + auto-scan)
 
 import asyncio, json, time, os
 from urllib.parse import urlparse, parse_qs
+
 import aiohttp
+from aiohttp import web
 import websockets
 
-PORT = int(os.environ.get("PORT", 3001))
+PORT = int(os.environ.get("PORT", 8080))
 
-TTL_LOCK     = 60_000
-TTL_USED     = 60 * 60 * 1000
-MIN_FREE_SLOTS = 1
-PAGE_LIMIT   = 100
-QUEUE_TARGET = 600
-CLEAN_EVERY  = 2.0
+# 🔴 CHANGE THIS TO YOUR PLACE ID
+PLACE_ID = os.environ.get("PLACE_ID", "123456789")
+MIN_PLAYERS = int(os.environ.get("MIN_PLAYERS", 5))
 
+PAGE_LIMIT = 100
 ORDERS = ("Asc", "Desc")
 
 def now_ms(): return int(time.time() * 1000)
 
 # --------------------------------------------------
 class Universe:
-    def __init__(self, uid: str):
+    def __init__(self, uid):
         self.uid = uid
-        self.min_players = 5
+        self.min_players = MIN_PLAYERS
         self.queue = []
-        self.locks = {}
-        self.used  = {}
-        self.seen  = set()
+        self.seen = set()
         self.cursor = {"Asc": None, "Desc": None}
-        self.delay  = {"Asc": 800,  "Desc": 800}
-        self.last_req = {"Asc": 0, "Desc": 0}
         self.scanning = False
-        self.waiters = []
-        self.pop_lock = asyncio.Lock()
 
-universes = {}
-
-def getU(uid: str) -> Universe:
-    if uid not in universes:
-        universes[uid] = Universe(uid)
-        asyncio.create_task(scanner_loop(universes[uid]))
-    return universes[uid]
+universe = Universe(PLACE_ID)
 
 # --------------------------------------------------
-def is_joinable(s, min_players):
+def is_joinable(s):
     playing = int(s.get("playing", 0))
     maxp = int(s.get("maxPlayers", 0))
-    if maxp <= playing: return False
-    if playing < min_players: return False
-    return True
+    return maxp > playing and playing >= universe.min_players
 
 # --------------------------------------------------
-async def fetch_page(session, uid, cursor, order):
-    base = f"https://games.roblox.com/v1/games/{uid}/servers/Public"
+async def fetch_page(session, cursor, order):
+    base = f"https://games.roblox.com/v1/games/{universe.uid}/servers/Public"
     url = f"{base}?sortOrder={order}&limit={PAGE_LIMIT}"
-    if cursor: url += f"&cursor={cursor}"
+    if cursor:
+        url += f"&cursor={cursor}"
     async with session.get(url) as r:
         r.raise_for_status()
         return await r.json()
 
 # --------------------------------------------------
-def push_servers(st, arr):
-    for sv in arr or []:
-        sid = str(sv.get("id") or "")
-        if not sid: continue
-        if sid in st.seen: continue
-        if not is_joinable(sv, st.min_players): continue
+async def scanner_loop():
+    if universe.scanning:
+        return
+    universe.scanning = True
 
-        st.queue.append(sid)
-        st.seen.add(sid)
-
-        # 🔥 PRINT WHEN DISCOVERED
-        print(f"[FOUND] jobId={sid} players={sv.get('playing')}")
-
-# --------------------------------------------------
-async def scanner_loop(st):
-    if st.scanning: return
-    st.scanning = True
+    print(f"[SCAN] Starting scan for placeId={universe.uid}")
 
     async with aiohttp.ClientSession() as session:
         while True:
             for order in ORDERS:
                 try:
-                    page = await fetch_page(session, st.uid, st.cursor[order], order)
-                    st.cursor[order] = page.get("nextPageCursor")
-                    push_servers(st, page.get("data"))
+                    page = await fetch_page(session, universe.cursor[order], order)
+                    universe.cursor[order] = page.get("nextPageCursor")
+
+                    for sv in page.get("data", []):
+                        sid = str(sv.get("id") or "")
+                        if not sid or sid in universe.seen:
+                            continue
+                        if not is_joinable(sv):
+                            continue
+
+                        universe.seen.add(sid)
+                        universe.queue.append(sid)
+
+                        # ✅ PRINT JOB IDS HERE
+                        print(f"[FOUND] jobId={sid} players={sv.get('playing')}")
+
                 except Exception as e:
                     print("[SCAN ERROR]", e)
-                    await asyncio.sleep(2)
-            await asyncio.sleep(0.5)
+
+            await asyncio.sleep(1)
 
 # --------------------------------------------------
-def pop_server(st, who):
-    while st.queue:
-        sid = st.queue.pop(0)
-        if sid in st.used: continue
-        st.used[sid] = now_ms()
-        print(f"[SEND] jobId={sid} → {who}")
-        return sid
-    return None
+async def ws_handler(ws):
+    print("[WS] client connected")
+
+    while universe.queue:
+        sid = universe.queue.pop(0)
+        print(f"[SEND] jobId={sid}")
+        await ws.send(json.dumps({"type": "next", "id": sid}))
+        break
 
 # --------------------------------------------------
-async def handle_ws(ws):
-    path = ws.request.path if hasattr(ws, "request") else ""
-    q = parse_qs(urlparse(path).query)
-
-    uid = q.get("placeId", [None])[0]
-    who = q.get("who", ["?"])[0]
-    min_players = int(q.get("minPlayers", [5])[0])
-
-    if not uid:
-        await ws.close()
-        return
-
-    st = getU(uid)
-    st.min_players = min_players
-
-    print(f"[WS] CONNECT who={who} placeId={uid}")
-
-    sid = pop_server(st, who)
-    if sid:
-        await ws.send(json.dumps({"type":"next","id":sid}))
+async def http_root(request):
+    return web.Response(
+        text="Hopper backend running.\nUse WebSocket at /ws\n",
+        content_type="text/plain"
+    )
 
 # --------------------------------------------------
 async def main():
-    print("="*60)
-    print("🚀 HOPPER BACKEND (DEBUG PRINT ENABLED)")
-    print(f"🌐 Listening on PORT {PORT}")
-    print("="*60)
+    print("=" * 60)
+    print("🚀 HOPPER BACKEND (HTTP + WS)")
+    print(f"🌐 Port: {PORT}")
+    print(f"🎯 placeId: {PLACE_ID}")
+    print(f"👥 minPlayers: {MIN_PLAYERS}")
+    print("=" * 60)
 
-    async with websockets.serve(handle_ws, "0.0.0.0", PORT):
-        await asyncio.Future()
+    # 🔥 START SCANNER IMMEDIATELY
+    asyncio.create_task(scanner_loop())
+
+    # HTTP server (browser-safe)
+    app = web.Application()
+    app.router.add_get("/", http_root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    # WebSocket server
+    await websockets.serve(ws_handler, "0.0.0.0", PORT, path="/ws")
+
+    await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
